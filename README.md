@@ -162,3 +162,4 @@ There are multiple ways to launch your own agent to control the vehicles.
 
 ## Reference
 https://github.com/zygn/ros2_py_racecar/tree/main
+https://github.com/JiatongSun/ESE615-Autonomous-Racing
