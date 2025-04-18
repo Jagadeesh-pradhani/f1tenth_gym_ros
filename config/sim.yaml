@@ -48,18 +48,23 @@ bridge:
     # opponent parameters
     num_agent: 1
 
+    # ------------------------------------------------------------------------------------
+    # ego starting pose on map
+    # change start positions based on the map
+
     # YasMarina_map
     # sx: -25.3
     # sy: 16.0
     # stheta: 0.0
 
-    # ego starting pose on map
+    
     # levine_obs
-    sx: 10.0 #-3.25
-    sy: 2.0 #-0.46 
+    sx: 10.0
+    sy: 2.0
     stheta: 1.57
 
-    # 9.7, 0
+    # -------------------------------------------------------------------------------------
+
     # opp starting pose on map
     sx1: 2.0
     sy1: 0.5

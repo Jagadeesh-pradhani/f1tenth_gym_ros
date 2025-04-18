@@ -8,18 +8,18 @@ from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
 
 #  Constants from xacro
-WIDTH = 0.2032  
-WHEEL_LENGTH = 0.0381  
-MAX_STEER = 0.72
+WIDTH = 0.2032  # (m)
+WHEEL_LENGTH = 0.0381  # (m)
+MAX_STEER = 0.36  # (rad)
 
 
-class autonomousMission(Node):
+class ReactiveFollowGap(Node):
     """
     Wall Following on the car
     """
 
     def __init__(self):
-        super().__init__('auto_node')
+        super().__init__('reactive_node')
 
         # Params
         self.declare_parameter('window_size', 5)
@@ -27,10 +27,11 @@ class autonomousMission(Node):
 
         self.declare_parameter('disparity_thresh', 0.15)
         self.declare_parameter('bubble_radius', 0.9*(WIDTH + 2 * WHEEL_LENGTH))
+        self.declare_parameter('corner_dist_thresh', 1.0)
+        self.declare_parameter('turning_angle_thresh', 20.0 * np.pi / 180.0)
 
-
-        self.declare_parameter('kp', 1.82)
-        self.declare_parameter('ki', 0.0001)
+        self.declare_parameter('kp', 1.0)
+        self.declare_parameter('ki', 0.0)
         self.declare_parameter('kd', 0.1)
         self.declare_parameter("max_control", MAX_STEER)
 
@@ -54,7 +55,10 @@ class autonomousMission(Node):
         self.drive_pub_ = self.create_publisher(AckermannDriveStamped, drive_topic, 10)
 
     def preprocess_lidar(self, ranges, range_min=0.0, range_max=np.inf):
-
+        """ Preprocess the LiDAR scan array. Expert implementation includes:
+            1.Setting each value to the mean over some window
+            2.Rejecting high values (e.g. > 3m)
+        """
         # Remove invalid readings
         proc_ranges = np.clip(ranges, range_min, range_max)
 
@@ -74,9 +78,14 @@ class autonomousMission(Node):
         """
         disparity_thresh = self.get_parameter('disparity_thresh').get_parameter_value().double_value
 
+        # Calculate difference between index [i] and [i-1]
+        # Prepend zero to align indices
         disparities = np.hstack((0, np.diff(ranges)))
 
-
+        # Two situations:
+        #     1. ranges[i-1] >> ranges[i]  => choose left_indices = ranges[i-1]
+        #     2. ranges[i-1] << ranges[i]  => choose right_indices = ranges[i]
+        # Concatenate two indices array as output
         left_indices = np.where(disparities > disparity_thresh)[0] - 1
         right_indices = np.where(disparities < -disparity_thresh)[0]
         indices = np.hstack((left_indices, right_indices))
@@ -92,11 +101,22 @@ class autonomousMission(Node):
         disparities, disparity_indices = self.find_disparities(ranges)
         indices = np.hstack((closest_indices, disparity_indices))
 
-
+        # Filter result: continuous indices come from same obstacle,
+        # only keep the index with the largest disparity
+        # e.g. indices = [2, 3, 4] and abs(disparities[2]) > abs(disparities[3]) > abs(disparities[4])
+        #      then filtered indices = [2]
         indices = np.sort(indices)
-
+        #bubble_indices = []
+        #curr = -1
+        #for idx in indices:
+        #    if curr == -1 or idx - curr > 1:
+        #        bubble_indices.append(idx)
+        #    elif abs(disparities[idx]) > abs(disparities[bubble_indices[-1]]):
+        #        bubble_indices[-1] = idx
+        #    curr = idx
         bubble_indices = indices.copy()
 
+        #self.get_logger().info("Num bubbles: %0.2f" % len(bubble_indices))
 
         return bubble_indices
 
@@ -104,23 +124,46 @@ class autonomousMission(Node):
     def find_max_gap(free_space_ranges):
         """ Return the start index & end index of the max gap in free_space_ranges
         """
+        # Assume ranges array: [1, 1, 1, 0, 0, 3, 3, 0, 0, 2, 2]
 
+        # 1. Prepend and append zero, so all gaps are bounded by zeros
+        #    The extended ranges array: [0, 1, 1, 1, 0, 0, 3, 3, 0, 0, 2, 2, 0]
+        #    Notice the index is shifted by 1
         extend_ranges = np.hstack((0, free_space_ranges, 0))
 
+        # 2. Find all indices that have zero: [0, 4, 5, 8, 9, 12]
         zero_indices = np.where(abs(extend_ranges<  0.0001))[0]
-
+        #    Calculate the difference between two consecutive indices: [4, 1, 3, 1, 3]
+        #    Minus 1 to get the gap angles: [3, 0, 2, 0, 2]
+        #    Prepend 0 to align indices: [0, 3, 0, 2, 0, 2]
+        #    Now, all positive values represents valid gap angles
         gap_angles = np.hstack((0, np.diff(zero_indices) - 1))
 
-
+        # 3. Retrieve the start index and end index for each gap in original ranges array
+        #    Only consider gap angles that are positive: [F, T, F, T, F, T]
+        #    True indices as right bound: [1, 3, 5]
+        #    Minus 1 as left bound: [0, 2, 4]
+        #    Note here left bound and right bound are indices of indices
         right_bound = np.where(gap_angles > 0)[0]
         left_bound = right_bound - 1
-
+        #    Get gap bounds (two zeros that bind the gap) by taking [[0, 1], [2, 3], [4, 5]]
+        #    indices from zero indices array [0, 4, 5, 8, 9, 12]
+        #    So the bound zeros are [[0, 4], [5, 8], [9, 12]]
         gap_bounds = zero_indices[np.vstack((left_bound, right_bound)).T]
-
+        #    Then we get real gap bounds by adding [1, -1]
+        #    So the real gap bound array: [[1, 3], [6, 7], [10, 11]]
+        #    Note that those indices are still shifted by 1, so we need to reduce 1
         gap_bounds = gap_bounds + np.array([1, -1])
         gap_bounds = gap_bounds - 1
 
-
+        # 4. Calculate area for each gap
+        #    Candidate heuristics:
+        #        (I)   gap angle
+        #        (II)  gap min distance
+        #        (III) gap max distance
+        #        (IV)  arc length (min_dist * angle || max_dist * angle || mean(dist) * angle)
+        #        (V)   integral area (∝ sum{gap ranges ^ 2})
+        #    Find max gap of all gaps
         num_gaps = len(gap_bounds)
         gap_angles = gap_angles[gap_angles > 0]
 
@@ -154,7 +197,10 @@ class autonomousMission(Node):
 
     @staticmethod
     def find_best_point(start_i, end_i, ranges, angles):
-        """ Find the best point in the gap
+        """ Start_i & end_i are start and end indices of max-gap range, respectively
+        Return index of best point in ranges
+        Naive: Choose the furthest point within ranges and go there
+        If more than one furthest points exist, choose the one with the least steering angle
         """
         gap_ranges = ranges[start_i:end_i + 1]
         gap_angles = angles[start_i:end_i + 1]
@@ -254,11 +300,11 @@ class autonomousMission(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    print("autonomousMission Initialized")
-    auto_node = autonomousMission()
-    rclpy.spin(auto_node)
+    print("WallFollow Initialized")
+    reactive_node = ReactiveFollowGap()
+    rclpy.spin(reactive_node)
 
-    auto_node.destroy_node()
+    reactive_node.destroy_node()
     rclpy.shutdown()
 
 
